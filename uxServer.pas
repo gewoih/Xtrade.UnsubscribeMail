@@ -11,7 +11,7 @@ uses
   ActiveX,
   Classes,
   AnsiStrings, 
-  Registry,
+  IniFiles,
   DateUtils,
   Variants,
   
@@ -20,13 +20,14 @@ uses
   mimepart, 
   blcksock,
   synautil, 
-  synachar, 
+  synachar,
+  EncdDecd,
   SynaCode;
 
 var
   Mail: TImapSend;
   Mime: TMimemess;
-  reg: TRegistry;
+  Params: TIniFile;
 
 
 function SvcStart:			boolean;
@@ -48,16 +49,14 @@ var fCon: oleVariant;
 
 function GetConStr: string;
 begin
-  reg.OpenKey('\SOFTWARE\Xtrade\XTrade.UnsubscribeMail.exe\sql', false);
-  Result := 'Provider='+reg.ReadString('Prov') + ';'; //SQLNCLI11;';
+  Result := 'Provider='+Params.ReadString('SQL', 'Prov', '') + ';'; //SQLNCLI11;';
   Result := Result + 'Persist Security Info=False;';
-  Result := Result + 'Data Source='+reg.ReadString('Serv') + ';';//192.168.44.100;';
-  Result := Result + 'Initial Catalog='+reg.ReadString('Base') + ';';//vtk;';
-  Result := Result + 'User ID='+reg.ReadString('User') + ';';//sa;';
+  Result := Result + 'Data Source='+Params.ReadString('SQL', 'Serv', '') + ';';//192.168.44.100;';
+  Result := Result + 'Initial Catalog='+Params.ReadString('SQL', 'Base', '') + ';';//vtk;';
+  Result := Result + 'User ID='+Params.ReadString('SQL', 'User', '') + ';';//sa;';
   Result := Result + 'Application Name=' + ExtractFileName(ParamStr(0))+ ';';
   Result := Result + 'MultipleActiveResultSets=True;';
-  Result := Result + 'Password='+reg.ReadString('Pass') + ';';//icq99802122;'
-  reg.CloseKey;
+  Result := Result + 'Password='+Params.ReadString('SQL','Pass', '') + ';';//icq99802122;'
 end;
 
 function ConnectSQL(Var Con:OleVariant): boolean;
@@ -84,13 +83,14 @@ end;
 
 function CheckAllowed(const str: string): boolean;
 var
-	i: integer;
+	c: char;
 begin
     Result := false;
-    for i:= 1 to Length(str) do
+    for C in str do
     begin
-        if not (str[i] in ['a'..'z', 'A'..'Z', '0'..'9', '_', '-', '.']) then
-        	Exit;
+        if C in [#13, #10, #160] then Continue;
+
+        if not (C in ['a'..'z', 'A'..'Z', '0'..'9', '_', '-', '.']) then Exit;
     end;
     Result:= true;
 end;
@@ -108,9 +108,6 @@ begin
     
     name_part:= Copy(str, 1, i - 1);
     server_part:= Copy(str, i + 1, Length(str));
-    
-    if (Length(str) = 0) or ((Length(str) < 5)) then
-    	Exit;
         
     i := Pos('.', str);
     if i = 0 then
@@ -121,55 +118,36 @@ end;
 
 class procedure tWalk.Walk(const Sender: TMimePart);
 var
-S, sql: string;
-rst: 	OleVariant;
 mail:	string;
 begin
-    mail := Sender.PartBody[0];
+	if Sender.Secondary<>'HTML' then Exit;
+    if Sender.Encoding <> 'BASE64' then
+    	mail := Trim(Sender.PartBody.Text)
+    else
+    	mail := Trim(DecodeString(Sender.PartBody.Text));
+
+    mail := StringReplace(mail, #$a0, '', [rfReplaceAll]);
+    mail := StringReplace(mail, #$0a, '', [rfReplaceAll]);
+    mail := StringReplace(mail, #$0d, '', [rfReplaceAll]);
+    mail := StringReplace(mail, '=', '', [rfReplaceAll]);
+    Debug('Почта ' + mail, ' хочет отписаться от рассылки');
+
+    if mail = '' then
+        Exit;
 
     if CheckMailFormat(mail) = false then
     begin
         Debug('Неверный формат почты', '');
         Exit;
     end;
-    
-    with Sender do
-    begin
-        DecodePart;
-//        if not (SameText(Disposition,'attachment') or SameText(Disposition,'inline')) then Exit;
-//        if Length(Filename)<>24 then Exit;
-//        if AnsiCompareText(ExtractFileExt(FileName),'.csv')<>0 then Exit;
-//        if Encoding = 'BASE64' then S := DecodeBase64(PartBody.Text) else S := PartBody.Text;
-//        sql := format('select dbo.AsStr(id, 6784, 0) ss from spr_data where nid=%s and metaid=1277', [copy(FileName,1,12)]);
-//        rst := fCon.Execute(sql);
-//        try
-//            WriteLog('Имя файла ' + FileName);
-//            Script.Clear;
-//            Script.Parent := fsGlobalUnit;
-//            InitFunctions(Script);
-//            Script.Lines.Text := rst.Fields[0].Value;
-//            Script.Variables['regid'] := copy(FileName, 1, 12);
-//            Script.Variables['data_op'] := copy(FileName, 13, 8);
-//            Script.Variables['file_content'] := S;
-//
-//            if Script.Compile then
-//            begin
-//                Script.Execute;
-//                sql := Script.Variables['sql'];
-//                fCon.Execute(sql);
-//            end
-//            else
-//				WriteLog('Не компилируется ' + Script.ErrorMsg + ' ' + Script.ErrorPos);
-//            except
-//            on E:Exception do
-//            begin
-//                WriteLog('Исключение ' + Filename + ' ' + Mime.Header.From +
-//                ' ' + DateToStr(Mime.Header.Date) + Script.ErrorMsg + ' ' + Script.ErrorPos);
-//                if IsConsole then ReadLn;
-//            end;
-//        end;
+
+    try
+    	ConnectSQL(fCon);
+		fCon.mng_unsubscribe(mail);
+        Debug('Почта ' + mail + ' была успешно удалена из рассылки.', '');
+    except
+    On E: Exception do Debug('Exception: ', E.Message);
     end;
-    //sl.Free;
 end;
 
 function IsNull(A, B: variant):variant;
@@ -182,49 +160,24 @@ begin
     CoInitializeEx(nil, 0);
     Result := True;
     try
-        try
-          reg := TRegistry.Create;
-          reg.RootKey := HKEY_CURRENT_USER;
+        Mail := TImapSend.Create;
+        Mime := TMimeMess.Create;
 
-          if not reg.OpenKey('\SOFTWARE\Xtrade\XTrade.UnsubscribeMail.exe\pop3', false)
-          then raise Exception.Create('Key POP3 not found');
+        Mail.TargetHost:=Params.ReadString('MAILBOX', 'TargetHost', '');
+        Mail.UserName:=Params.ReadString('MAILBOX', 'UserName', '');
+        Mail.Password:=Params.ReadString('MAILBOX', 'Password', '');
+        Mail.AutoTLS:=False;
+        Mail.TargetPort:=Params.ReadString('MAILBOX', 'Port', '143');
 
-          Mail := TImapSend.Create;
-          Mime := TMimeMess.Create;
+        fLoopDelay := Params.ReadInteger('COMMON', 'LoopDelay', 300000);
 
-          Debug('TargetHost', reg.ReadString('TargetHost'));
-          Debug('UserName', reg.ReadString('UserName'));
-          Debug('Password', reg.ReadString('Password'));
-
-          Mail.TargetHost:=reg.ReadString('TargetHost');
-          Mail.UserName:=reg.ReadString('UserName');
-          Mail.Password:=reg.ReadString('Password');
-          Mail.AutoTLS:=False;
-          Mail.TargetPort:='143';
-        finally
-          reg.CloseKey;
-        end;
-
-        try
-            reg := TRegistry.Create;
-            reg.RootKey := HKEY_CURRENT_USER;
-
-            if not reg.OpenKey('\SOFTWARE\Xtrade\XTrade.UnsubscribeMail.exe', false)
-            then raise Exception.Create('Key not found');
-
-            Debug('LoopDelay', reg.ReadInteger('LoopDelay'));
-            fLoopDelay := reg.ReadInteger('LoopDelay');
-        finally
-        	reg.CloseKey;
-        end;
-
-        except
+    except
         on E: exception do
         begin
             Debug('Error', E.Message);
             if IsConsole then
             begin
-                WriteLn('Press ENTER to exit');
+                Debug('Press ENTER to exit', '');
                 Readln;
             end;
             Result := False;
@@ -257,7 +210,7 @@ begin
                         Mime.MessagePart.WalkPart;
                         Debug('Mail from', Mime.Header.From);
                         Mail.CopyMess(I, 'Trash');
-                        //Mail.DeleteMess(I);
+                        Mail.DeleteMess(I);
                     end;
 
                     Mail.CloseFolder;
@@ -290,11 +243,14 @@ function SvcStop: boolean;
 begin
     Mail.Free;
     Mime.Free;
-    reg.free;
+    Params.free;
     CoUninitialize;
 end;
 
 initialization
+  Params := TIniFile.Create(ChangeFileExt(ParamStr(0), '.ini'));
 	FormatSettings.DecimalSeparator := '.';
+finalization
+  Params.Free;
 end.
 
